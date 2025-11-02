@@ -1,0 +1,27 @@
+Virtual Environment
+
+venv/
+*.pyc
+pycache/
+
+Environment files
+
+.env
+*.env
+
+API Uploads
+
+uploads/
+*.jpg
+
+Log files
+
+*.log
+
+IDE files
+
+.vscode/
+.idea/
+
+Credentials
+credentials.json

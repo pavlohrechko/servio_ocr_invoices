@@ -1,19 +1,20 @@
+"""
+Core logic for invoice mapping, refactored for import by API or CLI.
+Based on the user's original mapping.py.
+"""
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import openai
 from google.cloud import vision
-from rich.console import Console
-from rich.table import Table
 
 # ---------------------------------------------------------------------------
 # Configuration & logging
@@ -23,13 +24,13 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="[%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("invoice-mapper-cli")
+logger = logging.getLogger("core-mapper")
 
 # Set up API keys
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Initialize Rich Console for TUI
-console = Console()
+# Define the path for our persistent memory (database)
+DB_FILE = Path("confirmed_mappings.json")
 
 # ---------------------------------------------------------------------------
 # Test Menu
@@ -40,8 +41,6 @@ RESTAURANT_MENU = [
     "Chicken Wings", "Garlic Bread", "Tiramisu", "Cheesecake", "Newland",
     "Браслет з силікону"
 ]
-
-# його тут нема!
 
 # ---------------------------------------------------------------------------
 # Pydantic Schemas for Invoice Processing
@@ -61,9 +60,34 @@ class InvoiceMappingResponse(BaseModel):
     mapped_items: List[MappedItem]
 
 # ---------------------------------------------------------------------------
+# Functions to manage the persistent memory
+# ---------------------------------------------------------------------------
+def load_confirmed_mappings() -> Dict[str, str | None]:
+    """Loads the confirmed mappings from the JSON database file."""
+    if not DB_FILE.exists():
+        return {}
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading confirmed mappings from {DB_FILE}: {e}")
+        return {}
+
+def save_confirmed_mapping(invoice_item: str, menu_item: str | None):
+    """Saves a single confirmed or corrected mapping to the database."""
+    mappings = load_confirmed_mappings()
+    mappings[invoice_item] = menu_item
+    try:
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(mappings, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved mapping: '{invoice_item}' -> '{menu_item}'")
+    except IOError as e:
+        logger.error(f"Error saving confirmed mappings to {DB_FILE}: {e}")
+
+# ---------------------------------------------------------------------------
 # Prompt Template for Invoice Mapping
 # ---------------------------------------------------------------------------
-def get_system_prompt(menu: List[str]) -> str:
+def get_system_prompt(menu: List[str], confirmed_mappings: Dict[str, str | None]) -> str:
     menu_str = ", ".join(f'"{item}"' for item in menu)
     
     EMPTY_SCHEMA = {
@@ -74,80 +98,104 @@ def get_system_prompt(menu: List[str]) -> str:
         }]
     }
 
+    confirmed_mappings_str = ""
+    if confirmed_mappings:
+        mappings_json = json.dumps(confirmed_mappings, indent=2, ensure_ascii=False)
+        confirmed_mappings_str = (
+            "You have access to a memory of previously confirmed mappings. Use this information to guide your decisions.\n"
+            "Here are the confirmed mappings:\n"
+            f"{mappings_json}\n\n"
+        )
+
     return (
         "You are an expert system for a restaurant. Your task is to analyze text from a supplier invoice and map each purchased item to a dish on the restaurant's menu.\n\n"
+        f"{confirmed_mappings_str}"
         "Here is the restaurant's menu:\n"
         f"[{menu_str}]\n\n"
         "I will provide you with text blocks detected by OCR from an invoice. Identify the line items from the invoice text and map them according to the following rules:\n\n"
         "Rules (in order of importance):\n"
-        "1. **PRIORITY 1: Direct Name Match:** If an invoice item's name contains the exact name of an item on the menu (e.g., invoice item 'Newland Barcode Scanner' and menu item 'Newland'), you MUST map them. This is your most important rule.\n"
-        "2. **PRIORITY 2: Ingredient Mapping:** If no direct name match is found, THEN check if the invoice item is a clear ingredient for a menu dish (e.g., 'Tomatoes' for 'Margherita Pizza').\n"
-        "3. **No Match:** If an item cannot be mapped by either of the above rules (e.g., 'Cleaning Supplies'), set 'suggested_menu_dish' to null.\n\n"
+        "1. **PRIORITY 0: CONFIRMED MAPPINGS:** If an invoice item is identical or very similar to one from the confirmed mappings memory I provided, you MUST use that mapping. This is your most important rule.\n"
+        "2. **PRIORITY 1: Direct Name Match:** If no direct name match, if an invoice item's name contains the exact name of an item on the menu (e.g., invoice item 'Newland Barcode Scanner' and menu item 'Newland'), you MUST map them.\n"
+        "3. **PRIORITY 2: Ingredient Mapping:** If no direct name match is found, THEN check if the invoice item is a clear ingredient for a menu dish (e.g., 'Tomatoes' for 'Margherita Pizza').\n"
+        "4. **No Match:** If an item cannot be mapped by any of the above rules (e.g., 'Cleaning Supplies'), set 'suggested_menu_dish' to null.\n\n"
         "- Your output must be a valid JSON object following this exact structure, without any additional explanations outside of the JSON:\n"
-        f"{json.dumps(EMPTY_SCHEMA, indent=2)}"
+        f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
     )
 
 # ---------------------------------------------------------------------------
 # Google Vision OCR Helper
 # ---------------------------------------------------------------------------
 def google_vision_ocr(file_path: str | Path) -> OcrPayload:
-    """Runs document text detection on a local PDF, JPG, or PNG file."""
+    """
+    Runs document text detection on a local PDF, JPG, or PNG file.
+    Raises:
+        Exception: If Google Vision API returns an error or finds no text.
+    """
     try:
         client = vision.ImageAnnotatorClient()
         path = Path(file_path)
         content = path.read_bytes()
-
         image = vision.Image(content=content)
-        console.print(f"Sending '{path.name}' to Google Cloud Vision for OCR...", style="cyan")
+        
+        logger.info(f"Sending '{path.name}' to Google Cloud Vision for OCR...")
         response = client.document_text_detection(image=image)
         
         if response.error.message:
             logger.error(f"Google Vision API Error: {response.error.message}")
-            sys.exit(3)
+            raise Exception(f"Google Vision API Error: {response.error.message}")
 
         full_text = response.full_text_annotation.text
         if not full_text:
-            logger.error("Google Vision found no text in %s", file_path)
-            sys.exit(3)
+            logger.error(f"Google Vision found no text in {file_path}")
+            raise Exception(f"Google Vision found no text in {file_path}")
             
         logger.info("Google Vision extracted text successfully.")
         return OcrPayload(text_blocks=[TextBlock(text=full_text)])
     except Exception as e:
         logger.error(f"An error occurred during OCR: {e}")
-        sys.exit(1)
-
+        # Re-raise the exception to be caught by the caller (API or CLI)
+        raise
 
 # ---------------------------------------------------------------------------
 # LLM API Call
 # ---------------------------------------------------------------------------
 def _parse_response(text: str) -> InvoiceMappingResponse:
-    """Safely parses the JSON response from the LLM."""
+    """
+    Safely parses the JSON response from the LLM.
+    Raises:
+        json.JSONDecodeError: If the response is not valid JSON.
+        pydantic.ValidationError: If JSON structure doesn't match Pydantic model.
+    """
     try:
         if text.strip().startswith("```json"):
             text = text.strip()[7:-3]
-            
         data = json.loads(text)
         return InvoiceMappingResponse(**data)
     except Exception as exc:
-        logger.error("OpenAI returned unparsable JSON: %s", exc)
-        logger.debug("Raw response: %s", text)
-        sys.exit(2)
+        logger.error(f"LLM returned unparsable JSON: {exc}")
+        logger.debug(f"Raw response: {text}")
+        raise  # Re-raise to be caught by caller
 
-def call_openai_for_mapping(ocr: OcrPayload, model: str) -> InvoiceMappingResponse:
-    """Calls the OpenAI Chat Completions API to map invoice items."""
+def call_openai_for_mapping(
+    ocr: OcrPayload, model: str, confirmed_mappings: Dict[str, str | None]
+) -> InvoiceMappingResponse:
+    """
+    Calls the OpenAI Chat Completions API to map invoice items.
+    Raises:
+        Exception: If the API key is not set or the API call fails.
+    """
     if not openai.api_key:
         logger.error("OPENAI_API_KEY environment variable not set.")
-        sys.exit(1)
+        raise ValueError("OPENAI_API_KEY environment variable not set.")
 
-    system_prompt = get_system_prompt(RESTAURANT_MENU)
+    system_prompt = get_system_prompt(RESTAURANT_MENU, confirmed_mappings)
     user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
-    
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content}
     ]
 
-    console.print("Asking OpenAI to map invoice items to the menu...", style="cyan")
+    logger.info("Asking OpenAI to map invoice items to the menu (with memory)...")
     try:
         res = openai.chat.completions.create(
             model=model,
@@ -155,48 +203,8 @@ def call_openai_for_mapping(ocr: OcrPayload, model: str) -> InvoiceMappingRespon
             temperature=0,
             response_format={"type": "json_object"},
         )
-        
-        # This is the corrected line that fixes the bug from before
         response_text = res.choices[0].message.content
-        
         return _parse_response(response_text)
     except Exception as e:
         logger.error(f"Failed to process OpenAI response: {e}")
-        sys.exit(1)
-
-# ---------------------------------------------------------------------------
-# Terminal UI Display
-# ---------------------------------------------------------------------------
-def display_results_table(response: InvoiceMappingResponse):
-    """Displays the mapping results in a formatted table in the terminal."""
-    table = Table(title="Invoice to Menu Mapping Suggestions")
-    table.add_column("Invoice Item", style="magenta", no_wrap=True)
-    table.add_column("Suggested Menu Dish", style="green")
-    table.add_column("Notes", style="yellow")
-
-    for item in response.mapped_items:
-        dish = item.suggested_menu_dish if item.suggested_menu_dish else "[dim]No Match Found[/dim]"
-        table.add_row(item.invoice_item, dish, item.notes)
-
-    console.print(table)
-
-# ---------------------------------------------------------------------------
-# CLI Entry Point
-# ---------------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Map invoice items to a restaurant menu using OCR and LLM.")
-    parser.add_argument("input", help="Path to the invoice file (PDF, JPG, PNG)")
-    parser.add_argument("--model", "-m", dest="model_id", default="gpt-4o-mini", help="Override OpenAI model ID")
-    args = parser.parse_args()
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        logger.error("File not found: %s", input_path)
-        sys.exit(1)
-
-    ocr_payload = google_vision_ocr(input_path)
-    mapping_response = call_openai_for_mapping(ocr_payload, model=args.model_id)
-    display_results_table(mapping_response)
-
-if __name__ == "__main__":
-    main()
+        raise  # Re-raise to be caught by caller
