@@ -127,33 +127,61 @@ def get_system_prompt(menu: List[str], confirmed_mappings: Dict[str, str | None]
 # ---------------------------------------------------------------------------
 def google_vision_ocr(file_path: str | Path) -> OcrPayload:
     """
-    Runs document text detection on a local PDF, JPG, or PNG file.
-    Raises:
-        Exception: If Google Vision API returns an error or finds no text.
+    Runs text detection. Supports PDF (by converting to images) and standard images.
     """
-    try:
-        client = vision.ImageAnnotatorClient()
-        path = Path(file_path)
-        content = path.read_bytes()
-        image = vision.Image(content=content)
-        
-        logger.info(f"Sending '{path.name}' to Google Cloud Vision for OCR...")
-        response = client.document_text_detection(image=image)
-        
-        if response.error.message:
-            logger.error(f"Google Vision API Error: {response.error.message}")
-            raise Exception(f"Google Vision API Error: {response.error.message}")
+    client = vision.ImageAnnotatorClient()
+    path = Path(file_path)
+    full_text_combined = ""
 
-        full_text = response.full_text_annotation.text
-        if not full_text:
+    try:
+        # 1. Handle PDF Files
+        if path.suffix.lower() == '.pdf':
+            logger.info(f"Detected PDF: {path.name}. Converting pages to images...")
+            
+            # Convert PDF pages to images
+            images = convert_from_path(str(path))
+            
+            for i, image in enumerate(images):
+                logger.info(f"Processing page {i + 1} of {len(images)}...")
+                
+                # Convert PIL image to bytes for Google Vision
+                import io
+                img_byte_arr = io.BytesIO()
+                image.save(img_byte_arr, format='JPEG')
+                content = img_byte_arr.getvalue()
+                
+                # Send to Google Vision
+                vision_image = vision.Image(content=content)
+                response = client.document_text_detection(image=vision_image)
+                
+                if response.full_text_annotation.text:
+                    full_text_combined += response.full_text_annotation.text + "\n"
+
+        # 2. Handle Image Files (JPG, PNG)
+        else:
+            content = path.read_bytes()
+            image = vision.Image(content=content)
+            
+            logger.info(f"Sending '{path.name}' to Google Cloud Vision...")
+            response = client.document_text_detection(image=image)
+            
+            if response.error.message:
+                logger.error(f"Google Vision API Error: {response.error.message}")
+                raise Exception(f"Google Vision API Error: {response.error.message}")
+
+            if response.full_text_annotation.text:
+                full_text_combined = response.full_text_annotation.text
+
+        # 3. Final Validation
+        if not full_text_combined.strip():
             logger.error(f"Google Vision found no text in {file_path}")
             raise Exception(f"Google Vision found no text in {file_path}")
-            
-        logger.info("Google Vision extracted text successfully.")
-        return OcrPayload(text_blocks=[TextBlock(text=full_text)])
+
+        logger.info("OCR extraction successful.")
+        return OcrPayload(text_blocks=[TextBlock(text=full_text_combined)])
+
     except Exception as e:
         logger.error(f"An error occurred during OCR: {e}")
-        # Re-raise the exception to be caught by the caller (API or CLI)
         raise
 
 # ---------------------------------------------------------------------------
