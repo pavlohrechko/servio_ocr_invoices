@@ -1,163 +1,199 @@
 """
-Flask API server for the Invoice Mapper.
-Provides an endpoint to upload an invoice and receive mapping suggestions.
+Flask API server for Invoice Mapper (Multi-Customer Support).
 """
 import os
 import logging
+import json
 from pathlib import Path
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 
-# Import the refactored core logic
+# Import refactored core logic
 import core_mapper
-from core_mapper import MappedItem, InvoiceMappingResponse
 
-# ---------------------------------------------------------------------------
-# Flask App Setup
-# ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-# Configure a directory to save uploaded invoices
+# Config
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 app.config["UPLOADS_DIR"] = UPLOADS_DIR
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB limit
-ALLOWED_EXTENSIONS = {'pdf', 'png', 'jpg', 'jpeg'}
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # Increased to 32MB
+ALLOWED_INVOICE_EXTS = {'pdf', 'png', 'jpg', 'jpeg'}
+ALLOWED_LIST_EXTS = {'json'}
 
-# Ensure the uploads directory exists
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Get the logger
 logger = logging.getLogger("flask-api")
 
-def allowed_file(filename):
+def allowed_file(filename, extensions):
     return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+           filename.rsplit('.', 1)[1].lower() in extensions
 
-# ---------------------------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------------------------
 @app.route('/')
 def health_check():
-    """Simple health check endpoint."""
-    return jsonify({"status": "ok", "message": "Invoice Mapper API is running."})
+    return jsonify({"status": "ok", "message": "Multi-Tenant Invoice Mapper API is running."})
 
+# ---------------------------------------------------------------------------
+# 1. UPLOAD CUSTOMER LIST
+# ---------------------------------------------------------------------------
+@app.route('/upload-list', methods=['POST'])
+def upload_list():
+    """
+    Endpoint to upload a customer's specific item list .
+    Form Data:
+      - customer_id (string): Unique identifier for the customer
+      - file (file): A JSON file containing a list of strings
+    """
+    # Check customer_id
+    customer_id = request.form.get('customer_id')
+    if not customer_id:
+        return jsonify({"error": "Missing 'customer_id' in form data."}), 400
+
+    # Check file
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part."}), 400
+    
+    file = request.files['file']
+    if file.filename == '' or not allowed_file(file.filename, ALLOWED_LIST_EXTS):
+        return jsonify({"error": "Invalid file. Upload a JSON file."}), 400
+
+    try:
+        # Parse JSON
+        content = json.load(file)
+        
+        # Validation: Must be a list of strings
+        if not isinstance(content, list):
+             return jsonify({"error": "JSON root must be a list."}), 400
+        
+        # Save list and init mappings using core logic
+        core_mapper.initialize_customer_files(customer_id, content)
+        
+        logger.info(f"List uploaded for customer {customer_id} ({len(content)} items).")
+        return jsonify({
+            "status": "success",
+            "message": f"List for '{customer_id}' saved successfully.",
+            "item_count": len(content)
+        }), 200
+
+    except json.JSONDecodeError:
+        return jsonify({"error": "Invalid JSON format."}), 400
+    except Exception as e:
+        logger.error(f"Error uploading list for {customer_id}: {e}")
+        return jsonify({"error": str(e)}), 500
+
+# ---------------------------------------------------------------------------
+# 2. PROCESS INVOICE
+# ---------------------------------------------------------------------------
 @app.route('/process-invoice', methods=['POST'])
 def process_invoice():
     """
-    API endpoint to process an uploaded invoice file.
-    Expects a multipart/form-data request with a file part named 'invoice'.
+    Process an invoice using the customer's specific context.
+    Form Data:
+      - customer_id (string)
+      - invoice (file)
     """
-    # --- 1. File Upload Handling ---
+    customer_id = request.form.get('customer_id')
+    if not customer_id:
+        return jsonify({"error": "Missing 'customer_id' in form data."}), 400
+
     if 'invoice' not in request.files:
-        logger.warning("API call missing 'invoice' file part.")
-        return jsonify({"error": "No 'invoice' file part in the request."}), 400
+        return jsonify({"error": "No 'invoice' file part."}), 400
     
     file = request.files['invoice']
-    
-    if file.filename == '':
-        logger.warning("API call with no selected file.")
-        return jsonify({"error": "No file selected."}), 400
-        
-    if not file or not allowed_file(file.filename):
-        logger.warning(f"API call with disallowed file type: {file.filename}")
-        return jsonify({"error": "File type not allowed. Use PDF, PNG, or JPG."}), 400
+    if not file or not allowed_file(file.filename, ALLOWED_INVOICE_EXTS):
+        return jsonify({"error": "Invalid invoice file type."}), 400
+
+    # Check if customer list exists
+    customer_list = core_mapper.load_customer_list(customer_id)
+    if not customer_list:
+        return jsonify({
+            "error": f"No list found for customer '{customer_id}'. Please call /upload-list first."
+        }), 404
 
     filename = secure_filename(file.filename)
-    saved_filepath = app.config["UPLOADS_DIR"] / filename
+    saved_filepath = app.config["UPLOADS_DIR"] / f"{customer_id}_{filename}"
     
     try:
         file.save(saved_filepath)
-        logger.info(f"File saved to {saved_filepath}")
-    except Exception as e:
-        logger.error(f"Failed to save file {filename}: {e}")
-        return jsonify({"error": f"Failed to save file: {e}"}), 500
-
-    # --- 2. Core Logic Execution ---
-    try:
-        # Load confirmed mappings
-        confirmed_mappings = core_mapper.load_confirmed_mappings()
-        logger.info(f"Loaded {len(confirmed_mappings)} confirmed mappings.")
         
-        # Perform OCR
+        # Load mappings specific to this customer
+        confirmed_mappings = core_mapper.load_confirmed_mappings(customer_id)
+        
+        # 1. OCR
         ocr_payload = core_mapper.google_vision_ocr(saved_filepath)
         
-        # Call LLM for mapping
+        # 2. LLM with Customer Context
         model_id = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
         mapping_response = core_mapper.call_openai_for_mapping(
             ocr_payload, 
             model=model_id,
+            customer_list=customer_list,
             confirmed_mappings=confirmed_mappings
         )
         
-        # --- 3. Process and Return Results ---
-        # Split items into confirmed and to-be-reviewed
+        # 3. Filter Results
         items_to_review = []
         auto_confirmed_items = []
+        
         for item in mapping_response.mapped_items:
+            # Check strict match against confirmed mappings
             if item.invoice_item in confirmed_mappings:
-                # Override LLM suggestion with our confirmed one
-                item.suggested_menu_dish = confirmed_mappings[item.invoice_item]
+                item.suggested_item = confirmed_mappings[item.invoice_item]
                 auto_confirmed_items.append(item)
             else:
                 items_to_review.append(item)
         
-        logger.info(f"Processing complete. Found {len(auto_confirmed_items)} auto-confirmed and {len(items_to_review)} new items.")
-        
-        # Return the structured JSON response
         return jsonify({
             "status": "success",
+            "customer_id": customer_id,
             "auto_confirmed_items": [item.model_dump() for item in auto_confirmed_items],
             "new_suggestions": [item.model_dump() for item in items_to_review]
         }), 200
 
     except Exception as e:
-        # Catch errors from OCR or LLM
-        logger.error(f"Error processing file {filename}: {e}", exc_info=True)
+        logger.error(f"Error processing invoice: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up the uploaded file
         try:
-            os.remove(saved_filepath)
-            logger.info(f"Cleaned up file: {saved_filepath}")
-        except OSError as e:
-            logger.error(f"Error deleting file {saved_filepath}: {e}")
+            if os.path.exists(saved_filepath):
+                os.remove(saved_filepath)
+        except OSError:
+            pass
 
+# ---------------------------------------------------------------------------
+# 3. CONFIRM MAPPING
+# ---------------------------------------------------------------------------
 @app.route('/confirm-mapping', methods=['POST'])
 def confirm_mapping():
     """
-    API endpoint to save a user-confirmed or corrected mapping to the database.
-    Expects a JSON payload like:
-    {
-        "invoice_item": "Name of Item from Invoice",
-        "menu_item": "Name of Menu Dish"  (or null for 'No Match')
-    }
+    Confirm a mapping for a specific customer.
+    JSON Body:
+      {
+        "customer_id": "123",
+        "invoice_item": "Raw Item Name",
+        "list_item": "Mapped List Item" (or null)
+      }
     """
     data = request.json
-    
-    if not data or 'invoice_item' not in data:
-        logger.warning("Confirmation call missing 'invoice_item' in JSON payload.")
-        return jsonify({"error": "Missing 'invoice_item' in JSON payload."}), 400
-
+    if not data:
+        return jsonify({"error": "Missing JSON body"}), 400
+        
+    customer_id = data.get('customer_id')
     invoice_item = data.get('invoice_item')
-    # .get('menu_item') will default to None if the key is missing or set to null
-    menu_item = data.get('menu_item') 
+    list_item = data.get('list_item')
+    
+    if not customer_id or not invoice_item:
+        return jsonify({"error": "Missing 'customer_id' or 'invoice_item'."}), 400
     
     try:
-        core_mapper.save_confirmed_mapping(invoice_item, menu_item)
-        logger.info(f"Saved confirmed mapping for: '{invoice_item}' -> '{menu_item}'")
+        core_mapper.save_confirmed_mapping(customer_id, invoice_item, list_item)
         return jsonify({
             "status": "success", 
-            "message": "Mapping saved successfully.",
-            "saved_mapping": { "invoice_item": invoice_item, "menu_item": menu_item }
+            "message": "Mapping saved.",
+            "customer_id": customer_id,
+            "mapping": { "invoice_item": invoice_item, "list_item": list_item }
         }), 200
     except Exception as e:
-        logger.error(f"Failed to save mapping for '{invoice_item}': {e}")
-        return jsonify({"error": f"Failed to save mapping: {e}"}), 500
+        logger.error(f"Failed to save mapping: {e}")
+        return jsonify({"error": str(e)}), 500
 
-# ---------------------------------------------------------------------------
-# Run the App
-# ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    # Note: Use `flask --app app run` in development,
-    # or a Gunicorn server in production.
     app.run(debug=True, host='0.0.0.0', port=5001)

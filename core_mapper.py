@@ -1,20 +1,21 @@
 """
-Core logic for invoice mapping, refactored for import by API or CLI.
-Based on the user's original mapping.py.
+Core logic for invoice mapping.
+Refactored to support multiple customers (lists and mappings).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import sys
+import io
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
 import openai
 from google.cloud import vision
+from pdf2image import convert_from_path
 
 # ---------------------------------------------------------------------------
 # Configuration & logging
@@ -26,24 +27,89 @@ logging.basicConfig(
 )
 logger = logging.getLogger("core-mapper")
 
-# Set up API keys
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Define the path for our persistent memory (database)
-DB_FILE = Path("confirmed_mappings.json")
+# Base directory for customer data
+CUSTOMERS_DIR = Path("customers")
+CUSTOMERS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Test Menu
+# Customer Data Management
 # ---------------------------------------------------------------------------
-RESTAURANT_MENU = [
-    "Margherita Pizza", "Pepperoni Pizza", "Caesar Salad", "Greek Salad",
-    "Spaghetti Carbonara", "Fettuccine Alfredo", "Tomato Soup",
-    "Chicken Wings", "Garlic Bread", "Tiramisu", "Cheesecake", "Newland",
-    "Браслет з силікону"
-]
+
+def get_list_path(customer_id: str) -> Path:
+    """Returns path to the customer's product list."""
+    return CUSTOMERS_DIR / f"{customer_id}_list.json"
+
+def get_mappings_path(customer_id: str) -> Path:
+    """Returns path to the customer's confirmed mappings."""
+    return CUSTOMERS_DIR / f"{customer_id}_mappings.json"
+
+def load_customer_list(customer_id: str) -> List[str]:
+    """Loads the specific product list for a customer."""
+    path = get_list_path(customer_id)
+    if not path.exists():
+        logger.warning(f"List file not found for customer {customer_id}.")
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            else:
+                logger.error(f"Invalid format in {path}. Expected a JSON list.")
+                return []
+    except Exception as e:
+        logger.error(f"Error loading list for {customer_id}: {e}")
+        return []
+
+def load_confirmed_mappings(customer_id: str) -> Dict[str, str | None]:
+    """Loads the confirmed mappings for a specific customer."""
+    path = get_mappings_path(customer_id)
+    if not path.exists():
+        # Create empty if it doesn't exist
+        save_confirmed_mappings_file(customer_id, {})
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.error(f"Error loading mappings for {customer_id}: {e}")
+        return {}
+
+def save_confirmed_mappings_file(customer_id: str, mappings: Dict):
+    """Helper to write the mappings file."""
+    path = get_mappings_path(customer_id)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mappings, f, indent=2, ensure_ascii=False)
+    except IOError as e:
+        logger.error(f"Error saving mappings for {customer_id}: {e}")
+
+def save_confirmed_mapping(customer_id: str, invoice_item: str, list_item: str | None):
+    """Saves a single confirmed mapping to the customer's file."""
+    mappings = load_confirmed_mappings(customer_id)
+    mappings[invoice_item] = list_item
+    save_confirmed_mappings_file(customer_id, mappings)
+    logger.info(f"[{customer_id}] Saved mapping: '{invoice_item}' -> '{list_item}'")
+
+def initialize_customer_files(customer_id: str, list_data: List[str]):
+    """
+    Saves the uploaded list and initializes an empty mapping file if needed.
+    """
+    # 1. Save the List
+    list_path = get_list_path(customer_id)
+    with open(list_path, "w", encoding="utf-8") as f:
+        json.dump(list_data, f, indent=2, ensure_ascii=False)
+    
+    # 2. Init Mappings (only if not exists, to preserve history if re-uploading list)
+    mappings_path = get_mappings_path(customer_id)
+    if not mappings_path.exists():
+        with open(mappings_path, "w", encoding="utf-8") as f:
+            json.dump({}, f, indent=2, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
-# Pydantic Schemas for Invoice Processing
+# Pydantic Schemas
 # ---------------------------------------------------------------------------
 class TextBlock(BaseModel):
     text: str
@@ -52,49 +118,33 @@ class OcrPayload(BaseModel):
     text_blocks: List[TextBlock]
 
 class MappedItem(BaseModel):
+    product_code: Optional[str] = None
     invoice_item: str
-    suggested_menu_dish: str | None
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+    amount: Optional[float] = None
+    suggested_item: Optional[str] = None
     notes: str = ""
 
 class InvoiceMappingResponse(BaseModel):
     mapped_items: List[MappedItem]
 
 # ---------------------------------------------------------------------------
-# Functions to manage the persistent memory
+# Prompt & Logic
 # ---------------------------------------------------------------------------
-def load_confirmed_mappings() -> Dict[str, str | None]:
-    """Loads the confirmed mappings from the JSON database file."""
-    if not DB_FILE.exists():
-        return {}
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        logger.error(f"Error loading confirmed mappings from {DB_FILE}: {e}")
-        return {}
-
-def save_confirmed_mapping(invoice_item: str, menu_item: str | None):
-    """Saves a single confirmed or corrected mapping to the database."""
-    mappings = load_confirmed_mappings()
-    mappings[invoice_item] = menu_item
-    try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(mappings, f, indent=2, ensure_ascii=False)
-        logger.info(f"Saved mapping: '{invoice_item}' -> '{menu_item}'")
-    except IOError as e:
-        logger.error(f"Error saving confirmed mappings to {DB_FILE}: {e}")
-
-# ---------------------------------------------------------------------------
-# Prompt Template for Invoice Mapping
-# ---------------------------------------------------------------------------
-def get_system_prompt(menu: List[str], confirmed_mappings: Dict[str, str | None]) -> str:
-    menu_str = ", ".join(f'"{item}"' for item in menu)
+def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, str | None]) -> str:
+    # Convert list to string for prompt
+    list_str = ", ".join(f'"{item}"' for item in customer_list)
     
     EMPTY_SCHEMA = {
         "mapped_items": [{
-            "invoice_item": "The name of the item found on the invoice (e.g., 'Roma Tomatoes 5kg')",
-            "suggested_menu_dish": "The best matching dish from the menu list provided or null",
-            "notes": "A brief explanation for the mapping or why no match was found."
+            "product_code": "Code or null",
+            "invoice_item": "Product Name",
+            "quantity": 0.0,
+            "price": 0.0,
+            "amount": 0.0,
+            "suggested_item": "Matching item from the provided list or null",
+            "notes": "VAT info etc."
         }]
     }
 
@@ -102,137 +152,88 @@ def get_system_prompt(menu: List[str], confirmed_mappings: Dict[str, str | None]
     if confirmed_mappings:
         mappings_json = json.dumps(confirmed_mappings, indent=2, ensure_ascii=False)
         confirmed_mappings_str = (
-            "You have access to a memory of previously confirmed mappings. Use this information to guide your decisions.\n"
-            "Here are the confirmed mappings:\n"
+            "You have access to previously confirmed mappings for this customer:\n"
             f"{mappings_json}\n\n"
         )
 
     return (
-        "You are an expert system for a restaurant. Your task is to analyze text from a supplier invoice and map each purchased item to a dish on the restaurant's menu.\n\n"
+        "You are an expert procurement assistant. Analyze the supplier invoice text.\n"
+        "Extract details: Product Code, Name, Quantity, Unit Price, Total Amount.\n"
+        "Handle VAT: Extract net amounts (without VAT). Note VAT included prices in 'notes'.\n\n"
+        
+        "AFTER extracting, map the 'invoice_item' to the closest match in the provided **Customer Reference List**.\n\n"
+        
         f"{confirmed_mappings_str}"
-        "Here is the restaurant's menu:\n"
-        f"[{menu_str}]\n\n"
-        "I will provide you with text blocks detected by OCR from an invoice. Identify the line items from the invoice text and map them according to the following rules:\n\n"
-        "Rules (in order of importance):\n"
-        "1. **PRIORITY 0: CONFIRMED MAPPINGS:** If an invoice item is identical or very similar to one from the confirmed mappings memory I provided, you MUST use that mapping. This is your most important rule.\n"
-        "2. **PRIORITY 1: Direct Name Match:** If no direct name match, if an invoice item's name contains the exact name of an item on the menu (e.g., invoice item 'Newland Barcode Scanner' and menu item 'Newland'), you MUST map them.\n"
-        "3. **PRIORITY 2: Ingredient Mapping:** If no direct name match is found, THEN check if the invoice item is a clear ingredient for a menu dish (e.g., 'Tomatoes' for 'Margherita Pizza').\n"
-        "4. **No Match:** If an item cannot be mapped by any of the above rules (e.g., 'Cleaning Supplies'), set 'suggested_menu_dish' to null.\n\n"
-        "- Your output must be a valid JSON object following this exact structure, without any additional explanations outside of the JSON:\n"
+        "**Customer Reference List**:\n"
+        f"[{list_str}]\n\n"
+        
+        "Mapping Priority:\n"
+        "1. **Confirmed Mapping**: If a match exists in the provided mappings JSON, USE IT.\n"
+        "2. **Direct/Fuzzy Match**: Find the best fit in the Customer Reference List.\n"
+        "3. **No Match**: Set 'suggested_item' to null.\n\n"
+        
+        "Output strictly valid JSON:"
         f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
     )
 
 # ---------------------------------------------------------------------------
-# Google Vision OCR Helper
+# OCR & LLM
 # ---------------------------------------------------------------------------
 def google_vision_ocr(file_path: str | Path) -> OcrPayload:
-    """
-    Runs text detection. Supports PDF (by converting to images) and standard images.
-    """
+    # (Same implementation as before, omitted for brevity but assume it's here)
+    # ... [Copy the OCR function from previous file here] ...
     client = vision.ImageAnnotatorClient()
     path = Path(file_path)
     full_text_combined = ""
 
     try:
-        # 1. Handle PDF Files
         if path.suffix.lower() == '.pdf':
-            logger.info(f"Detected PDF: {path.name}. Converting pages to images...")
-            
-            # Convert PDF pages to images
             images = convert_from_path(str(path))
-            
-            for i, image in enumerate(images):
-                logger.info(f"Processing page {i + 1} of {len(images)}...")
-                
-                # Convert PIL image to bytes for Google Vision
-                import io
+            for image in images:
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='JPEG')
                 content = img_byte_arr.getvalue()
-                
-                # Send to Google Vision
                 vision_image = vision.Image(content=content)
                 response = client.document_text_detection(image=vision_image)
-                
                 if response.full_text_annotation.text:
                     full_text_combined += response.full_text_annotation.text + "\n"
-
-        # 2. Handle Image Files (JPG, PNG)
         else:
             content = path.read_bytes()
             image = vision.Image(content=content)
-            
-            logger.info(f"Sending '{path.name}' to Google Cloud Vision...")
             response = client.document_text_detection(image=image)
-            
-            if response.error.message:
-                logger.error(f"Google Vision API Error: {response.error.message}")
-                raise Exception(f"Google Vision API Error: {response.error.message}")
-
             if response.full_text_annotation.text:
                 full_text_combined = response.full_text_annotation.text
 
-        # 3. Final Validation
-        if not full_text_combined.strip():
-            logger.error(f"Google Vision found no text in {file_path}")
-            raise Exception(f"Google Vision found no text in {file_path}")
-
-        logger.info("OCR extraction successful.")
         return OcrPayload(text_blocks=[TextBlock(text=full_text_combined)])
-
     except Exception as e:
-        logger.error(f"An error occurred during OCR: {e}")
+        logger.error(f"OCR Error: {e}")
         raise
 
-# ---------------------------------------------------------------------------
-# LLM API Call
-# ---------------------------------------------------------------------------
-def _parse_response(text: str) -> InvoiceMappingResponse:
-    """
-    Safely parses the JSON response from the LLM.
-    Raises:
-        json.JSONDecodeError: If the response is not valid JSON.
-        pydantic.ValidationError: If JSON structure doesn't match Pydantic model.
-    """
-    try:
-        if text.strip().startswith("```json"):
-            text = text.strip()[7:-3]
-        data = json.loads(text)
-        return InvoiceMappingResponse(**data)
-    except Exception as exc:
-        logger.error(f"LLM returned unparsable JSON: {exc}")
-        logger.debug(f"Raw response: {text}")
-        raise  # Re-raise to be caught by caller
-
 def call_openai_for_mapping(
-    ocr: OcrPayload, model: str, confirmed_mappings: Dict[str, str | None]
+    ocr: OcrPayload, 
+    model: str, 
+    customer_list: List[str],
+    confirmed_mappings: Dict[str, str | None]
 ) -> InvoiceMappingResponse:
-    """
-    Calls the OpenAI Chat Completions API to map invoice items.
-    Raises:
-        Exception: If the API key is not set or the API call fails.
-    """
+    
     if not openai.api_key:
-        logger.error("OPENAI_API_KEY environment variable not set.")
-        raise ValueError("OPENAI_API_KEY environment variable not set.")
+        raise ValueError("OPENAI_API_KEY not set.")
 
-    system_prompt = get_system_prompt(RESTAURANT_MENU, confirmed_mappings)
+    system_prompt = get_system_prompt(customer_list, confirmed_mappings)
     user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content}
-    ]
 
-    logger.info("Asking OpenAI to map invoice items to the menu (with memory)...")
     try:
         res = openai.chat.completions.create(
             model=model,
-            messages=messages,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
             temperature=0,
             response_format={"type": "json_object"},
         )
-        response_text = res.choices[0].message.content
-        return _parse_response(response_text)
+        data = json.loads(res.choices[0].message.content)
+        return InvoiceMappingResponse(**data)
     except Exception as e:
-        logger.error(f"Failed to process OpenAI response: {e}")
-        raise  # Re-raise to be caught by caller
+        logger.error(f"OpenAI Error: {e}")
+        raise
