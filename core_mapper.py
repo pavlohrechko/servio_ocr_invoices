@@ -27,7 +27,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("core-mapper")
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# openai.api_key = os.getenv("OPENAI_API_KEY")
+
+client = openai.OpenAI(
+    base_url="http://localhost:11434/v1",  # Default Ollama URL
+    api_key="ollama"  # Required string, but content doesn't matter
+)
 
 # Base directory for customer data
 CUSTOMERS_DIR = Path("customers")
@@ -216,15 +221,27 @@ def call_openai_for_mapping(
     confirmed_mappings: Dict[str, str | None]
 ) -> InvoiceMappingResponse:
     
-    if not openai.api_key:
-        raise ValueError("OPENAI_API_KEY not set.")
+    # if not openai.api_key:
+    #     raise ValueError("OPENAI_API_KEY not set.")
 
     system_prompt = get_system_prompt(customer_list, confirmed_mappings)
     user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
 
+    # try:
+    #     res = openai.chat.completions.create(
+    #         model=model,
+    #         messages=[
+    #             {"role": "system", "content": system_prompt},
+    #             {"role": "user", "content": user_content}
+    #         ],
+    #         temperature=0,
+    #         response_format={"type": "json_object"},
+    #     )
+    #     data = json.loads(res.choices[0].message.content)
+    #     return InvoiceMappingResponse(**data)
     try:
-        res = openai.chat.completions.create(
-            model=model,
+        res = client.chat.completions.create(  # Use 'client', not 'openai'
+            model="qwen2.5:14b",  # MUST match the name you pulled in Step 3
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
