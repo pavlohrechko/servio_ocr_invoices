@@ -1,6 +1,6 @@
 """
 Core logic for invoice mapping.
-Refactored to support multiple customers (lists and mappings).
+Refactored to use Google Gemini API (1.5 Flash) instead of OpenAI.
 """
 from __future__ import annotations
 
@@ -8,12 +8,15 @@ import json
 import logging
 import os
 import io
+import typing
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel
-import openai
+
+# --- REPLACEMENT: Google Generative AI ---
+import google.generativeai as genai
 from google.cloud import vision
 from pdf2image import convert_from_path
 
@@ -27,7 +30,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("core-mapper")
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Configure Gemini
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GENAI_API_KEY:
+    logger.error("GEMINI_API_KEY not found in environment variables.")
+else:
+    genai.configure(api_key=GENAI_API_KEY)
 
 # Base directory for customer data
 CUSTOMERS_DIR = Path("customers")
@@ -102,7 +110,7 @@ def initialize_customer_files(customer_id: str, list_data: List[str]):
     with open(list_path, "w", encoding="utf-8") as f:
         json.dump(list_data, f, indent=2, ensure_ascii=False)
     
-    # 2. Init Mappings (only if not exists, to preserve history if re-uploading list)
+    # 2. Init Mappings
     mappings_path = get_mappings_path(customer_id)
     if not mappings_path.exists():
         with open(mappings_path, "w", encoding="utf-8") as f:
@@ -123,7 +131,7 @@ class MappedItem(BaseModel):
     quantity: Optional[float] = None
     price: Optional[float] = None
     amount: Optional[float] = None
-    suggested_item: Optional[str] = None
+    suggested_item: Optional[str] = None  # Validated as Optional
     notes: str = ""
 
 class InvoiceMappingResponse(BaseModel):
@@ -172,16 +180,14 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
         "2. **Direct/Fuzzy Match**: Find the best fit in the Customer Reference List.\n"
         "3. **No Match**: Set 'suggested_item' to null.\n\n"
         
-        "Output strictly valid JSON:"
+        "Output strictly valid JSON following this schema:"
         f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
     )
 
 # ---------------------------------------------------------------------------
-# OCR & LLM
+# Google Vision OCR Helper (Unchanged)
 # ---------------------------------------------------------------------------
 def google_vision_ocr(file_path: str | Path) -> OcrPayload:
-    # (Same implementation as before, omitted for brevity but assume it's here)
-    # ... [Copy the OCR function from previous file here] ...
     client = vision.ImageAnnotatorClient()
     path = Path(file_path)
     full_text_combined = ""
@@ -209,31 +215,61 @@ def google_vision_ocr(file_path: str | Path) -> OcrPayload:
         logger.error(f"OCR Error: {e}")
         raise
 
-def call_openai_for_mapping(
+# ---------------------------------------------------------------------------
+# Gemini API Call (Fixed for 2.0 Flash)
+# ---------------------------------------------------------------------------
+def call_gemini_for_mapping(
     ocr: OcrPayload, 
     model: str, 
     customer_list: List[str],
     confirmed_mappings: Dict[str, str | None]
 ) -> InvoiceMappingResponse:
     
-    if not openai.api_key:
-        raise ValueError("OPENAI_API_KEY not set.")
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ValueError("GEMINI_API_KEY not set.")
 
-    system_prompt = get_system_prompt(customer_list, confirmed_mappings)
+    # 1. Prepare Prompt
+    system_instruction = get_system_prompt(customer_list, confirmed_mappings)
     user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
 
     try:
-        res = openai.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
+        # 2. Configure Model
+        # Default to 'gemini-2.0-flash'
+        base_name = "gemini-2.0-flash"
+        
+        # If app.py sends a specific gemini model, use it (stripping prefix to avoid duplication)
+        if model and "gemini" in model:
+             base_name = model.replace("models/", "")
+        
+        # FORCE the 'models/' prefix required by the API
+        target_model = f"models/{base_name}"
+
+        gemini_model = genai.GenerativeModel(
+            model_name=target_model,  # <--- FIXED: Use the string name, not the object itself
+            system_instruction=system_instruction,
+            generation_config={"response_mime_type": "application/json"}
         )
-        data = json.loads(res.choices[0].message.content)
+
+        logger.info(f"Calling Gemini ({target_model})...")
+        
+        # 3. Generate Content
+        response = gemini_model.generate_content(user_content)
+        
+        # 4. Parse JSON
+        try:
+            data = json.loads(response.text)
+        except json.JSONDecodeError:
+            clean_text = response.text.strip().replace("```json", "").replace("```", "")
+            data = json.loads(clean_text)
+
         return InvoiceMappingResponse(**data)
+
     except Exception as e:
-        logger.error(f"OpenAI Error: {e}")
+        logger.error(f"Gemini API Error: {e}")
+        # Helper to debug safety blocks
+        if 'response' in locals() and hasattr(response, 'prompt_feedback'):
+             logger.error(f"Feedback: {response.prompt_feedback}")
         raise
+
+# Keep the alias at the bottom
+call_openai_for_mapping = call_gemini_for_mapping
