@@ -57,7 +57,7 @@ def upload_list():
 
     try:
         # Parse JSON
-        content = json.load(file)
+        content = json.loads(file.read().decode('utf-8-sig'))
         
         # Validation: Must be a list of strings
         if not isinstance(content, list):
