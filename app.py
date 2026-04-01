@@ -121,8 +121,8 @@ def process_invoice():
         ocr_payload = core_mapper.google_vision_ocr(saved_filepath)
         
         # 2. LLM with Customer Context
-        model_id = os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
-        mapping_response = core_mapper.call_openai_for_mapping(
+        model_id = "gemini-2.5-flash"
+        mapping_response = core_mapper.call_gemini_for_mapping(
             ocr_payload, 
             model=model_id,
             customer_list=customer_list,

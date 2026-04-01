@@ -68,7 +68,7 @@ curl -X POST [http://127.0.0.1:5001/process-invoice](http://127.0.0.1:5001/proce
   "new_suggestions": [
     {
       "invoice_item": "Свіжі Томати 10кг",
-      "suggested_menu_dish": "Томати",
+      "suggested_item": "Томати",
       "quantity": 10.0,
       "price": 50.0
     }

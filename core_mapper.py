@@ -3,6 +3,7 @@ Core logic for invoice mapping.
 Refactored to support multiple customers (lists and mappings).
 """
 from __future__ import annotations
+import google.generativeai as genai
 
 import json
 import logging
@@ -27,7 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("core-mapper")
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+openai.api_key = os.getenv("GEMINI_API_KEY")
 
 # Base directory for customer data
 CUSTOMERS_DIR = Path("customers")
@@ -180,8 +181,6 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
 # OCR & LLM
 # ---------------------------------------------------------------------------
 def google_vision_ocr(file_path: str | Path) -> OcrPayload:
-    # (Same implementation as before, omitted for brevity but assume it's here)
-    # ... [Copy the OCR function from previous file here] ...
     client = vision.ImageAnnotatorClient()
     path = Path(file_path)
     full_text_combined = ""
@@ -209,31 +208,25 @@ def google_vision_ocr(file_path: str | Path) -> OcrPayload:
         logger.error(f"OCR Error: {e}")
         raise
 
-def call_openai_for_mapping(
-    ocr: OcrPayload, 
-    model: str, 
-    customer_list: List[str],
-    confirmed_mappings: Dict[str, str | None]
-) -> InvoiceMappingResponse:
-    
-    if not openai.api_key:
-        raise ValueError("OPENAI_API_KEY not set.")
 
+def call_gemini_for_mapping(ocr, model, customer_list, confirmed_mappings):
     system_prompt = get_system_prompt(customer_list, confirmed_mappings)
     user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
 
-    try:
-        res = openai.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        data = json.loads(res.choices[0].message.content)
-        return InvoiceMappingResponse(**data)
-    except Exception as e:
-        logger.error(f"OpenAI Error: {e}")
-        raise
+    gemini_model = genai.GenerativeModel(model)
+    response = gemini_model.generate_content(system_prompt + "\n\n" + user_content)
+
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    data = json.loads(text)
+
+    for item in data.get("mapped_items", []):
+        if item.get("suggested_item") == "null":
+            item["suggested_item"] = None
+
+    return InvoiceMappingResponse(**data)
