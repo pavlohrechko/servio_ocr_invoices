@@ -3,7 +3,6 @@ Core logic for invoice mapping.
 Refactored to support multiple customers (lists and mappings).
 """
 from __future__ import annotations
-import google.generativeai as genai
 
 import json
 import logging
@@ -13,15 +12,17 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 
 from dotenv import load_dotenv
+load_dotenv()  # Must be before anything reads env vars
+
+import google.generativeai as genai
 from pydantic import BaseModel
 import openai
 from google.cloud import vision
 from pdf2image import convert_from_path
 
-# ---------------------------------------------------------------------------
-# Configuration & logging
-# ---------------------------------------------------------------------------
-load_dotenv()
+GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=GENAI_API_KEY)
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="[%(levelname)s] %(message)s",
