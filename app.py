@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
+import pandas as pd # Import pandas
 
 # Import refactored core logic
 import core_mapper
@@ -19,6 +20,7 @@ app.config["UPLOADS_DIR"] = UPLOADS_DIR
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # Increased to 32MB
 ALLOWED_INVOICE_EXTS = {'pdf', 'png', 'jpg', 'jpeg'}
 ALLOWED_LIST_EXTS = {'json'}
+ALLOWED_EXCEL_EXTS = {'xls', 'xlsx'} # New: Allowed Excel extensions
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("flask-api")
@@ -150,6 +152,93 @@ def process_invoice():
 
     except Exception as e:
         logger.error(f"Error processing invoice: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            if os.path.exists(saved_filepath):
+                os.remove(saved_filepath)
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------------------
+# 4. PROCESS EXCEL INVOICE
+# ---------------------------------------------------------------------------
+@app.route('/process-excel-invoice', methods=['POST'])
+def process_excel_invoice():
+    """
+    Process an Excel invoice using the customer's specific context.
+    Form Data:
+      - customer_id (string)
+      - file (file): An Excel file (.xls or .xlsx)
+    """
+    customer_id = request.form.get('customer_id')
+    if not customer_id:
+        return jsonify({"error": "Missing 'customer_id' in form data."}), 400
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No 'file' part."}), 400
+    
+    file = request.files['file']
+    if not file or not allowed_file(file.filename, ALLOWED_EXCEL_EXTS):
+        return jsonify({"error": "Invalid file type. Upload an Excel file (.xls or .xlsx)."}), 400
+
+    # Check if customer list exists
+    customer_list = core_mapper.load_customer_list(customer_id)
+    if not customer_list:
+        return jsonify({
+            "error": f"No list found for customer '{customer_id}'. Please call /upload-list first."
+        }), 404
+
+    filename = secure_filename(file.filename)
+    saved_filepath = app.config["UPLOADS_DIR"] / f"{customer_id}_{filename}"
+    
+    try:
+        file.save(saved_filepath)
+        
+        # Read Excel file into pandas DataFrame
+        if filename.endswith('.xlsx'):
+            df = pd.read_excel(saved_filepath, engine='openpyxl')
+        else: # .xls
+            df = pd.read_excel(saved_filepath, engine='xlrd')
+            
+        # Convert DataFrame to a string format suitable for LLM
+        # For simplicity, let's convert the DataFrame to a CSV string.
+        # The LLM will need to be prompted to understand this format.
+        excel_content_for_llm = df.to_csv(index=False)
+        
+        # Load mappings specific to this customer
+        confirmed_mappings = core_mapper.load_confirmed_mappings(customer_id)
+        
+        # Call LLM with Customer Context
+        model_id = "gemini-2.5-flash"
+        mapping_response = core_mapper.call_gemini_for_mapping(
+            excel_content_for_llm, # Pass the Excel content as the payload
+            model=model_id,
+            customer_list=customer_list,
+            confirmed_mappings=confirmed_mappings
+        )
+        
+        # Filter Results (same logic as process_invoice)
+        items_to_review = []
+        auto_confirmed_items = []
+        
+        for item in mapping_response.mapped_items:
+            # Check strict match against confirmed mappings
+            if item.invoice_item in confirmed_mappings:
+                item.suggested_item = confirmed_mappings[item.invoice_item]
+                auto_confirmed_items.append(item)
+            else:
+                items_to_review.append(item)
+        
+        return jsonify({
+            "status": "success",
+            "customer_id": customer_id,
+            "auto_confirmed_items": [item.model_dump() for item in auto_confirmed_items],
+            "new_suggestions": [item.model_dump() for item in items_to_review]
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error processing Excel invoice: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
         try:
