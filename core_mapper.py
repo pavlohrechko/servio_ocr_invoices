@@ -48,10 +48,8 @@ def get_mappings_path(customer_id: str) -> Path:
     return CUSTOMERS_DIR / f"{customer_id}_mappings.json"
 
 def load_customer_list(customer_id: str) -> List[str]:
-    """Loads the specific product list for a customer."""
     path = get_list_path(customer_id)
     if not path.exists():
-        logger.warning(f"List file not found for customer {customer_id}.")
         return []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -61,7 +59,7 @@ def load_customer_list(customer_id: str) -> List[str]:
             else:
                 logger.error(f"Invalid format in {path}. Expected a JSON list.")
                 return []
-    except Exception as e:
+    except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
         logger.error(f"Error loading list for {customer_id}: {e}")
         return []
 
@@ -75,8 +73,9 @@ def load_confirmed_mappings(customer_id: str) -> Dict[str, str | None]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
+    except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
         logger.error(f"Error loading mappings for {customer_id}: {e}")
+        save_confirmed_mappings_file(customer_id, {})
         return {}
 
 def save_confirmed_mappings_file(customer_id: str, mappings: Dict):
