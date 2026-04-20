@@ -122,6 +122,7 @@ class MappedItem(BaseModel):
     product_code: Optional[str] = None
     invoice_item: str
     quantity: Optional[float] = None
+    unit: Optional[str] = None
     price: Optional[float] = None
     amount: Optional[float] = None
     suggested_item: Optional[str] = None
@@ -136,12 +137,13 @@ class InvoiceMappingResponse(BaseModel):
 def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, str | None]) -> str:
     # Convert list to string for prompt
     list_str = ", ".join(f'"{item}"' for item in customer_list)
-    
+
     EMPTY_SCHEMA = {
         "mapped_items": [{
             "product_code": "Code or null",
             "invoice_item": "Product Name",
             "quantity": 0.0,
+            "unit": "Unit of measurement (шт, кг, л, уп, кор, пл, etc.) or null",
             "price": 0.0,
             "amount": 0.0,
             "suggested_item": "Matching item from the provided list or null",
@@ -159,7 +161,7 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
 
     return (
         "You are an expert procurement assistant. Analyze the supplier invoice text.\n"
-        "Extract details: Product Code, Name, Quantity, Unit Price, Total Amount.\n"
+        "Extract details: Product Code, Name, Quantity, Unit of Measurement, Unit Price, Total Amount.\n"
         "Handle VAT: Extract net amounts (without VAT). Note VAT included prices in 'notes'.\n\n"
         
         "AFTER extracting, map the 'invoice_item' to the closest match in the provided **Customer Reference List**.\n\n"
