@@ -217,16 +217,31 @@ def call_gemini_for_mapping(ocr, model, customer_list, confirmed_mappings):
     response = gemini_model.generate_content(system_prompt + "\n\n" + user_content)
 
     text = response.text.strip()
+
+    # Strip markdown code fences
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
             text = text[4:]
     text = text.strip()
 
+    logger.info(f"Gemini raw response: {text[:500]}")  # debug
+
     data = json.loads(text)
 
-    for item in data.get("mapped_items", []):
-        if item.get("suggested_item") == "null":
-            item["suggested_item"] = None
+    # Ensure mapped_items is a list of dicts, not strings
+    items = data.get("mapped_items", [])
+    if not isinstance(items, list):
+        raise ValueError(f"Unexpected mapped_items format: {type(items)}")
 
-    return InvoiceMappingResponse(**data)
+    sanitized_items = []
+    for item in items:
+        if isinstance(item, dict):
+            # Fix "null" string -> None
+            if item.get("suggested_item") == "null":
+                item["suggested_item"] = None
+            sanitized_items.append(item)
+        else:
+            logger.warning(f"Skipping non-dict item: {item}")
+
+    return InvoiceMappingResponse(mapped_items=sanitized_items)

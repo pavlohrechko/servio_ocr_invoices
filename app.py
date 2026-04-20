@@ -84,6 +84,21 @@ def upload_list():
 # ---------------------------------------------------------------------------
 # 2. PROCESS INVOICE
 # ---------------------------------------------------------------------------
+
+@app.route('/debug-ocr', methods=['POST'])
+def debug_ocr():
+    if 'invoice' not in request.files:
+        return jsonify({"error": "No file"}), 400
+    file = request.files['invoice']
+    filename = secure_filename(file.filename)
+    saved_filepath = app.config["UPLOADS_DIR"] / filename
+    file.save(saved_filepath)
+    try:
+        ocr_payload = core_mapper.google_vision_ocr(saved_filepath)
+        return jsonify({"ocr_text": ocr_payload.text_blocks[0].text})
+    finally:
+        os.remove(saved_filepath)
+
 @app.route('/process-invoice', methods=['POST'])
 def process_invoice():
     """
@@ -211,8 +226,9 @@ def process_excel_invoice():
         
         # Call LLM with Customer Context
         model_id = "gemini-2.5-flash"
+        excel_payload = core_mapper.OcrPayload(text_blocks=[core_mapper.TextBlock(text=excel_content_for_llm)])
         mapping_response = core_mapper.call_gemini_for_mapping(
-            excel_content_for_llm, # Pass the Excel content as the payload
+            excel_payload,
             model=model_id,
             customer_list=customer_list,
             confirmed_mappings=confirmed_mappings
