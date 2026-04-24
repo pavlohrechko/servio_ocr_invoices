@@ -124,10 +124,12 @@ class MappedItem(BaseModel):
     quantity: Optional[float] = None
     unit: Optional[str] = None
     price: Optional[float] = None
+    price_nds: Optional[float] = None
     amount: Optional[float] = None
+    amount_nds: Optional[float] = None
+    nds: Optional[str] = None
     suggested_item: Optional[str] = None
-    notes: str = ""
-
+    notes: Optional[str] = ""
 class InvoiceMappingResponse(BaseModel):
     mapped_items: List[MappedItem]
 
@@ -143,11 +145,14 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
             "product_code": "Code or null",
             "invoice_item": "Product Name",
             "quantity": 0.0,
-            "unit": "Unit of measurement (шт, кг, л, уп, кор, пл, etc.) or null",
+            "unit": "Unit of measurement or null",
             "price": 0.0,
+            "price_nds": 0.0,
             "amount": 0.0,
+            "amount_nds": 0.0,
+            "nds": "VAT percentage as string e.g. '20%' or null",
             "suggested_item": "Matching item from the provided list or null",
-            "notes": "VAT info etc."
+            "notes": "Any additional info"
         }]
     }
 
@@ -161,20 +166,23 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
 
     return (
         "You are an expert procurement assistant. Analyze the supplier invoice text.\n"
-        "Extract details: Product Code, Name, Quantity, Unit of Measurement, Unit Price, Total Amount.\n"
-        "Handle VAT: Extract net amounts (without VAT). Note VAT included prices in 'notes'.\n\n"
-        
+        "Extract details: Product Code, Name, Quantity, Unit of Measurement, "
+        "Unit Price without VAT (price), Unit Price with VAT (price_nds), "
+        "Total Amount without VAT (amount), Total Amount with VAT (amount_nds), "
+        "VAT percentage as string (nds, e.g. '20%', '14%').\n"
+        "If only one price is given, derive the other using the VAT rate found in the document.\n\n"
+
         "AFTER extracting, map the 'invoice_item' to the closest match in the provided **Customer Reference List**.\n\n"
-        
+
         f"{confirmed_mappings_str}"
         "**Customer Reference List**:\n"
         f"[{list_str}]\n\n"
-        
+
         "Mapping Priority:\n"
         "1. **Confirmed Mapping**: If a match exists in the provided mappings JSON, USE IT.\n"
         "2. **Direct/Fuzzy Match**: Find the best fit in the Customer Reference List.\n"
         "3. **No Match**: Set 'suggested_item' to null.\n\n"
-        
+
         "Output strictly valid JSON:"
         f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
     )
