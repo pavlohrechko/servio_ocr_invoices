@@ -14,22 +14,18 @@ from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
 load_dotenv()  # Must be before anything reads env vars
 
-import google.generativeai as genai
+from google import genai
 from pydantic import BaseModel
-import openai
-from google.cloud import vision
 from pdf2image import convert_from_path
 
 GENAI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GENAI_API_KEY)
+genai_client = genai.Client(api_key=GENAI_API_KEY)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="[%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("core-mapper")
-
-openai.api_key = os.getenv("GEMINI_API_KEY")
 
 # Base directory for customer data
 CUSTOMERS_DIR = Path("customers")
@@ -188,44 +184,33 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
     )
 
 # ---------------------------------------------------------------------------
-# OCR & LLM
+# LLM
 # ---------------------------------------------------------------------------
-def google_vision_ocr(file_path: str | Path) -> OcrPayload:
-    client = vision.ImageAnnotatorClient()
-    path = Path(file_path)
-    full_text_combined = ""
 
-    try:
-        if path.suffix.lower() == '.pdf':
-            images = convert_from_path(str(path))
-            for image in images:
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='JPEG')
-                content = img_byte_arr.getvalue()
-                vision_image = vision.Image(content=content)
-                response = client.document_text_detection(image=vision_image)
-                if response.full_text_annotation.text:
-                    full_text_combined += response.full_text_annotation.text + "\n"
-        else:
-            content = path.read_bytes()
-            image = vision.Image(content=content)
-            response = client.document_text_detection(image=image)
-            if response.full_text_annotation.text:
-                full_text_combined = response.full_text_annotation.text
-
-        return OcrPayload(text_blocks=[TextBlock(text=full_text_combined)])
-    except Exception as e:
-        logger.error(f"OCR Error: {e}")
-        raise
-
-
-def call_gemini_for_mapping(ocr, model, customer_list, confirmed_mappings):
+def call_gemini_for_mapping(image_path_or_ocr, model, customer_list, confirmed_mappings, is_excel=False):
     system_prompt = get_system_prompt(customer_list, confirmed_mappings)
-    user_content = json.dumps(ocr.model_dump(), ensure_ascii=False)
 
-    gemini_model = genai.GenerativeModel(model)
-    response = gemini_model.generate_content(system_prompt + "\n\n" + user_content)
+    if is_excel:
+        # Excel: already text, send as string
+        user_content = image_path_or_ocr
+        contents = [system_prompt + "\n\n" + user_content]
+    else:
+        # Image/PDF: send directly to Gemini Vision
+        path = Path(image_path_or_ocr)
+        if path.suffix.lower() == '.pdf':
+            from pdf2image import convert_from_path
+            import PIL.Image
+            images = convert_from_path(str(path))
+            contents = [system_prompt] + images
+        else:
+            import PIL.Image
+            image = PIL.Image.open(path)
+            contents = [system_prompt, image]
 
+    response = genai_client.models.generate_content(
+        model=model,
+        contents=contents
+    )
     text = response.text.strip()
 
     # Strip markdown code fences
@@ -235,11 +220,10 @@ def call_gemini_for_mapping(ocr, model, customer_list, confirmed_mappings):
             text = text[4:]
     text = text.strip()
 
-    logger.info(f"Gemini raw response: {text[:500]}")  # debug
+    logger.info(f"Gemini raw response: {text[:500]}")
 
     data = json.loads(text)
 
-    # Ensure mapped_items is a list of dicts, not strings
     items = data.get("mapped_items", [])
     if not isinstance(items, list):
         raise ValueError(f"Unexpected mapped_items format: {type(items)}")
@@ -247,7 +231,6 @@ def call_gemini_for_mapping(ocr, model, customer_list, confirmed_mappings):
     sanitized_items = []
     for item in items:
         if isinstance(item, dict):
-            # Fix "null" string -> None
             if item.get("suggested_item") == "null":
                 item["suggested_item"] = None
             sanitized_items.append(item)

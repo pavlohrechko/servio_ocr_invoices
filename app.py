@@ -131,22 +131,19 @@ def process_invoice():
     try:
         file.save(saved_filepath)
         
+        app.json.ensure_ascii = False
+
+        
         # Load mappings specific to this customer
         confirmed_mappings = core_mapper.load_confirmed_mappings(customer_id)
         
-        # 1. OCR
-        ocr_payload = core_mapper.google_vision_ocr(saved_filepath)
-        
-        # 2. LLM with Customer Context
-        model_id = "gemini-2.5-flash"
         mapping_response = core_mapper.call_gemini_for_mapping(
-            ocr_payload, 
-            model=model_id,
+            saved_filepath,       
+            model="gemini-2.5-flash-lite",
             customer_list=customer_list,
             confirmed_mappings=confirmed_mappings
         )
         
-        # 3. Filter Results
         items_to_review = []
         auto_confirmed_items = []
         
@@ -226,12 +223,12 @@ def process_excel_invoice():
         
         # Call LLM with Customer Context
         model_id = "gemini-2.5-flash"
-        excel_payload = core_mapper.OcrPayload(text_blocks=[core_mapper.TextBlock(text=excel_content_for_llm)])
         mapping_response = core_mapper.call_gemini_for_mapping(
-            excel_payload,
+            excel_content_for_llm,   # CSV string
             model=model_id,
             customer_list=customer_list,
-            confirmed_mappings=confirmed_mappings
+            confirmed_mappings=confirmed_mappings,
+            is_excel=True
         )
         
         # Filter Results (same logic as process_invoice)
