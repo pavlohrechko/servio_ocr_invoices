@@ -139,7 +139,7 @@ def process_invoice():
         
         mapping_response = core_mapper.call_gemini_for_mapping(
             saved_filepath,       
-            model="gemini-2.5-flash-lite",
+            model="gemini-2.5-flash",
             customer_list=customer_list,
             confirmed_mappings=confirmed_mappings
         )
