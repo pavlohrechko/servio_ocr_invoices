@@ -24,6 +24,9 @@ ALLOWED_INVOICE_EXTS = {'pdf', 'png', 'jpg', 'jpeg', 'heic', 'csv', 'xlsx', 'xls
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("flask-api")
 
+def normalize(s: str) -> str:
+    return s.strip().lower()
+
 def allowed_file(filename, extensions):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in extensions
@@ -223,11 +226,13 @@ def process_excel_invoice():
         # Filter Results (same logic as process_invoice)
         items_to_review = []
         auto_confirmed_items = []
-        
+
+        confirmed_lower = {normalize(k): v for k, v in confirmed_mappings.items()}
+
         for item in mapping_response.mapped_items:
-            # Check strict match against confirmed mappings
-            if item.invoice_item in confirmed_mappings:
-                item.suggested_item = confirmed_mappings[item.invoice_item]
+            key = normalize(item.invoice_item)
+            if key in confirmed_lower:
+                item.suggested_item = confirmed_lower[key]
                 auto_confirmed_items.append(item)
             else:
                 items_to_review.append(item)
