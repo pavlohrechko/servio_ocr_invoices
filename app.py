@@ -18,9 +18,8 @@ app = Flask(__name__)
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 app.config["UPLOADS_DIR"] = UPLOADS_DIR
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # Increased to 32MB
-ALLOWED_INVOICE_EXTS = {'pdf', 'png', 'jpg', 'jpeg'}
-ALLOWED_LIST_EXTS = {'json'}
-ALLOWED_EXCEL_EXTS = {'xls', 'xlsx'} # New: Allowed Excel extensions
+
+ALLOWED_INVOICE_EXTS = {'pdf', 'png', 'jpg', 'jpeg', 'heic', 'csv', 'xlsx', 'xls', 'docx', 'doc'}
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger("flask-api")
@@ -101,60 +100,50 @@ def debug_ocr():
 
 @app.route('/process-invoice', methods=['POST'])
 def process_invoice():
-    """
-    Process an invoice using the customer's specific context.
-    Form Data:
-      - customer_id (string)
-      - invoice (file)
-    """
     customer_id = request.form.get('customer_id')
     if not customer_id:
         return jsonify({"error": "Missing 'customer_id' in form data."}), 400
 
     if 'invoice' not in request.files:
         return jsonify({"error": "No 'invoice' file part."}), 400
-    
+
     file = request.files['invoice']
     if not file or not allowed_file(file.filename, ALLOWED_INVOICE_EXTS):
-        return jsonify({"error": "Invalid invoice file type."}), 400
+        return jsonify({"error": f"Unsupported file type. Allowed: {ALLOWED_INVOICE_EXTS}"}), 400
 
-    # Check if customer list exists
     customer_list = core_mapper.load_customer_list(customer_id)
     if not customer_list:
-        return jsonify({
-            "error": f"No list found for customer '{customer_id}'. Please call /upload-list first."
-        }), 404
+        return jsonify({"error": f"No list found for customer '{customer_id}'."}), 404
 
     filename = secure_filename(file.filename)
+    ext = filename.rsplit('.', 1)[1].lower()
     saved_filepath = app.config["UPLOADS_DIR"] / f"{customer_id}_{filename}"
-    
+
     try:
         file.save(saved_filepath)
-        
         app.json.ensure_ascii = False
-
-        
-        # Load mappings specific to this customer
         confirmed_mappings = core_mapper.load_confirmed_mappings(customer_id)
-        
+
         mapping_response = core_mapper.call_gemini_for_mapping(
-            saved_filepath,       
+            saved_filepath,
+            ext=ext,
             model="gemini-2.5-flash",
             customer_list=customer_list,
             confirmed_mappings=confirmed_mappings
         )
-        
+
         items_to_review = []
         auto_confirmed_items = []
-        
+        confirmed_lower = {normalize(k): v for k, v in confirmed_mappings.items()}
+
         for item in mapping_response.mapped_items:
-            # Check strict match against confirmed mappings
-            if item.invoice_item in confirmed_mappings:
-                item.suggested_item = confirmed_mappings[item.invoice_item]
+            key = normalize(item.invoice_item)
+            if key in confirmed_lower:
+                item.suggested_item = confirmed_lower[key]
                 auto_confirmed_items.append(item)
             else:
                 items_to_review.append(item)
-        
+
         return jsonify({
             "status": "success",
             "customer_id": customer_id,

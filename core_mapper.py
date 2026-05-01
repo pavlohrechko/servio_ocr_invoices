@@ -187,25 +187,54 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
 # LLM
 # ---------------------------------------------------------------------------
 
-def call_gemini_for_mapping(image_path_or_ocr, model, customer_list, confirmed_mappings, is_excel=False):
+def call_gemini_for_mapping(file_path, ext, model, customer_list, confirmed_mappings):
     system_prompt = get_system_prompt(customer_list, confirmed_mappings)
+    path = Path(file_path)
 
-    if is_excel:
-        # Excel: already text, send as string
-        user_content = image_path_or_ocr
-        contents = [system_prompt + "\n\n" + user_content]
+    # --- Text-based formats: convert to string, send as text ---
+    if ext in {'xlsx', 'xls'}:
+        import pandas as pd
+        engine = 'openpyxl' if ext == 'xlsx' else 'xlrd'
+        df = pd.read_excel(path, engine=engine)
+        contents = [system_prompt + "\n\n" + df.to_csv(index=False)]
+
+    elif ext == 'csv':
+        import pandas as pd
+        df = pd.read_csv(path)
+        contents = [system_prompt + "\n\n" + df.to_csv(index=False)]
+
+    elif ext in {'docx', 'doc'}:
+        from docx import Document
+        doc = Document(str(path))
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    parts.append(row_text)
+        contents = [system_prompt + "\n\n" + "\n".join(parts)]
+
+    # --- Visual formats: send image directly to Gemini Vision ---
+    elif ext == 'pdf':
+        from pdf2image import convert_from_path
+        images = convert_from_path(str(path))
+        contents = [system_prompt] + images
+
+    elif ext == 'heic':
+        from pillow_heif import register_heif_opener
+        register_heif_opener()
+        import PIL.Image
+        contents = [system_prompt, PIL.Image.open(path)]
+
+    elif ext in {'jpg', 'jpeg', 'png'}:
+        import PIL.Image
+        contents = [system_prompt, PIL.Image.open(path)]
+
     else:
-        # Image/PDF: send directly to Gemini Vision
-        path = Path(image_path_or_ocr)
-        if path.suffix.lower() == '.pdf':
-            from pdf2image import convert_from_path
-            import PIL.Image
-            images = convert_from_path(str(path))
-            contents = [system_prompt] + images
-        else:
-            import PIL.Image
-            image = PIL.Image.open(path)
-            contents = [system_prompt, image]
+        raise ValueError(f"Unsupported file extension: {ext}")
 
     response = genai_client.models.generate_content(
         model=model,
@@ -213,7 +242,6 @@ def call_gemini_for_mapping(image_path_or_ocr, model, customer_list, confirmed_m
     )
     text = response.text.strip()
 
-    # Strip markdown code fences
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -223,7 +251,6 @@ def call_gemini_for_mapping(image_path_or_ocr, model, customer_list, confirmed_m
     logger.info(f"Gemini raw response: {text[:500]}")
 
     data = json.loads(text)
-
     items = data.get("mapped_items", [])
     if not isinstance(items, list):
         raise ValueError(f"Unexpected mapped_items format: {type(items)}")
