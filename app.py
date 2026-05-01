@@ -10,12 +10,17 @@ from werkzeug.utils import secure_filename
 import pandas as pd 
 import time
 
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from functools import wraps
+
 # Import refactored core logic
 import core_mapper
 
 app = Flask(__name__)
 
 # Config
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", "uploads"))
 app.config["UPLOADS_DIR"] = UPLOADS_DIR
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # Increased to 32MB
@@ -33,7 +38,34 @@ def allowed_file(filename, extensions):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in extensions
 
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+        
+        token = auth_header.split(" ")[1]
+        
+        try:
+            id_info = id_token.verify_oauth2_token(
+                token,
+                google_requests.Request(),
+                GOOGLE_CLIENT_ID
+            )
+            request.user = {
+                "email": id_info.get("email"),
+                "name": id_info.get("name"),
+                "sub": id_info.get("sub")
+            }
+        except ValueError as e:
+            return jsonify({"error": f"Invalid token: {e}"}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route('/')
+@require_auth
 def health_check():
     return jsonify({"status": "ok", "message": "Multi-Tenant Invoice Mapper API is running."})
 
@@ -41,6 +73,7 @@ def health_check():
 # 1. UPLOAD CUSTOMER LIST
 # ---------------------------------------------------------------------------
 @app.route('/upload-list', methods=['POST'])
+@require_auth
 def upload_list():
     """
     Endpoint to upload a customer's specific item list .
@@ -89,21 +122,8 @@ def upload_list():
 # 2. PROCESS INVOICE
 # ---------------------------------------------------------------------------
 
-@app.route('/debug-ocr', methods=['POST'])
-def debug_ocr():
-    if 'invoice' not in request.files:
-        return jsonify({"error": "No file"}), 400
-    file = request.files['invoice']
-    filename = secure_filename(file.filename)
-    saved_filepath = app.config["UPLOADS_DIR"] / filename
-    file.save(saved_filepath)
-    try:
-        ocr_payload = core_mapper.google_vision_ocr(saved_filepath)
-        return jsonify({"ocr_text": ocr_payload.text_blocks[0].text})
-    finally:
-        os.remove(saved_filepath)
-
 @app.route('/process-invoice', methods=['POST'])
+@require_auth
 def process_invoice():
     start_time = time.time()
     customer_id = request.form.get('customer_id')
@@ -174,6 +194,7 @@ def process_invoice():
 # 3. CONFIRM MAPPING
 # ---------------------------------------------------------------------------
 @app.route('/confirm-mapping', methods=['POST'])
+@require_auth
 def confirm_mapping():
     """
     Confirm a mapping for a specific customer.

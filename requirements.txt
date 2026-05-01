@@ -36,6 +36,7 @@ pydantic==2.11.9
 pydantic_core==2.33.2
 Pygments==2.19.2
 python-docx
+google-auth
 python-dotenv==1.1.1
 requests==2.32.5
 rich==14.1.0
