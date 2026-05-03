@@ -1,6 +1,9 @@
 """
 Flask API server for Invoice Mapper (Multi-Customer Support).
 """
+from gevent import monkey
+monkey.patch_all()
+
 import os
 import logging
 import json
@@ -13,11 +16,23 @@ import time
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from functools import wraps
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
+from auth import auth_bp
 
 # Import refactored core logic
 import core_mapper
 
 app = Flask(__name__)
+
+# JWT config
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "change-this-in-production")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = 3600      # 1 hour
+app.config["JWT_REFRESH_TOKEN_EXPIRES"] = 2592000  # 30 days
+
+jwt = JWTManager(app)
+
+# Register auth blueprint
+app.register_blueprint(auth_bp)
 
 # Config
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -38,34 +53,8 @@ def allowed_file(filename, extensions):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in extensions
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Missing or invalid Authorization header"}), 401
-        
-        token = auth_header.split(" ")[1]
-        
-        try:
-            id_info = id_token.verify_oauth2_token(
-                token,
-                google_requests.Request(),
-                GOOGLE_CLIENT_ID
-            )
-            request.user = {
-                "email": id_info.get("email"),
-                "name": id_info.get("name"),
-                "sub": id_info.get("sub")
-            }
-        except ValueError as e:
-            return jsonify({"error": f"Invalid token: {e}"}), 401
-        
-        return f(*args, **kwargs)
-    return decorated
-
 @app.route('/')
-@require_auth
+@jwt_required()
 def health_check():
     return jsonify({"status": "ok", "message": "Multi-Tenant Invoice Mapper API is running."})
 
@@ -73,7 +62,7 @@ def health_check():
 # 1. UPLOAD CUSTOMER LIST
 # ---------------------------------------------------------------------------
 @app.route('/upload-list', methods=['POST'])
-@require_auth
+@jwt_required()
 def upload_list():
     """
     Endpoint to upload a customer's specific item list .
@@ -123,7 +112,7 @@ def upload_list():
 # ---------------------------------------------------------------------------
 
 @app.route('/process-invoice', methods=['POST'])
-@require_auth
+@jwt_required()
 def process_invoice():
     start_time = time.time()
     customer_id = request.form.get('customer_id')
@@ -194,7 +183,7 @@ def process_invoice():
 # 3. CONFIRM MAPPING
 # ---------------------------------------------------------------------------
 @app.route('/confirm-mapping', methods=['POST'])
-@require_auth
+@jwt_required()
 def confirm_mapping():
     """
     Confirm a mapping for a specific customer.
