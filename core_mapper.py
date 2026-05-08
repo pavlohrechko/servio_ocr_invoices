@@ -161,27 +161,42 @@ def get_system_prompt(customer_list: List[str], confirmed_mappings: Dict[str, st
         )
 
     return (
-        "You are an expert procurement assistant. Analyze the supplier invoice text.\n"
-        "Extract details: Product Code, Name, Quantity, Unit of Measurement, "
-        "Unit Price without VAT (price), Unit Price with VAT (price_nds), "
-        "Total Amount without VAT (amount), Total Amount with VAT (amount_nds), "
-        "VAT percentage as string (nds, e.g. '20%', '14%').\n"
-        "If only one price is given, derive the other using the VAT rate found in the document.\n\n"
+            "You are an expert procurement assistant. Analyze the supplier invoice text.\n\n"
 
-        "AFTER extracting, map the 'invoice_item' to the closest match in the provided **Customer Reference List**.\n\n"
+            "## EXTRACTION RULES\n"
+            "Extract the following fields for each line item:\n"
+            "- 'product_code': ONLY if there is a dedicated product code column separate from the item name. Otherwise null.\n"
+            "- 'invoice_item': Full product name exactly as written in the invoice. Do not modify or interpret.\n"
+            "- 'quantity': Numeric quantity. null if not present.\n"
+            "- 'unit': Unit of measurement (шт, кг, л, пляш., кор., уп. etc). null if not present.\n"
+            "- 'price': Unit price WITHOUT VAT. Numeric only.\n"
+            "- 'price_nds': Unit price WITH VAT. Numeric only.\n"
+            "- 'amount': Total amount WITHOUT VAT (price × quantity). Numeric only.\n"
+            "- 'amount_nds': Total amount WITH VAT (price_nds × quantity). Numeric only.\n"
+            "- 'nds': VAT rate as string (e.g. '20%', '14%'). null if not explicitly stated in the document — do NOT assume.\n"
+            "- 'notes': Empty string '' unless there is critical info not captured in other fields.\n\n"
 
-        f"{confirmed_mappings_str}"
-        "**Customer Reference List**:\n"
-        f"[{list_str}]\n\n"
+            "## PRICE DERIVATION\n"
+            "If only price without VAT is given: price_nds = price × (1 + nds_rate).\n"
+            "If only price with VAT is given: price = price_nds / (1 + nds_rate).\n"
+            "If VAT rate is not stated anywhere in the document: set nds to null, set both price and price_nds to the given value.\n\n"
 
-        "Mapping Priority:\n"
-        "1. **Confirmed Mapping**: If a match exists in the provided mappings JSON, USE IT.\n"
-        "2. **Direct/Fuzzy Match**: Find the best fit in the Customer Reference List.\n"
-        "3. **No Match**: Set 'suggested_item' to null.\n\n"
+            "## MAPPING RULES\n"
+            "After extracting, map each 'invoice_item' to the closest match in the Customer Reference List.\n\n"
 
-        "Output strictly valid JSON:"
-        f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
-    )
+            f"{confirmed_mappings_str}"
+            "**Customer Reference List**:\n"
+            f"[{list_str}]\n\n"
+
+            "Mapping Priority:\n"
+            "1. **Confirmed Mapping**: If invoice_item exists in the confirmed mappings JSON, USE IT exactly.\n"
+            "2. **Direct/Fuzzy Match**: Find the best semantic match in the Customer Reference List.\n"
+            "3. **No Match**: Set 'suggested_item' to null.\n\n"
+
+            "## OUTPUT\n"
+            "Output ONLY strictly valid JSON, no markdown, no explanation:\n"
+            f"{json.dumps(EMPTY_SCHEMA, indent=2, ensure_ascii=False)}"
+        )
 
 # ---------------------------------------------------------------------------
 # LLM
