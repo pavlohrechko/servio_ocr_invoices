@@ -131,7 +131,11 @@ def process_invoice():
         return jsonify({"error": f"No list found for customer '{customer_id}'."}), 404
 
     filename = secure_filename(file.filename)
-    ext = filename.rsplit('.', 1)[1].lower()
+    ext = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
+    if not ext:
+        return jsonify({"error": "File has no extension."}), 400
+    if not filename:
+        filename = f"invoice.{ext}"
     saved_filepath = app.config["UPLOADS_DIR"] / f"{customer_id}_{filename}"
 
     try:
